@@ -1,26 +1,46 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-cd /volume1/docker/openhab/general
-
-
-
-ENV_FILE="./.env"
+# ── Configuration (override via .env or environment variables) ─────────────────
+ENV_FILE="$(dirname "${BASH_SOURCE[0]}")/.env"
 [[ -f "$ENV_FILE" ]] && set -a && . "$ENV_FILE" && set +a
 
-. ./lib_common.sh
+. "$(dirname "${BASH_SOURCE[0]}")/lib_common.sh"
 
+WORK_DIR="${WORK_DIR:-/volume1/docker/openhab/general}"
+OH_DATA_ROOT="${OH_DATA_ROOT:-/volume1/docker/openhab}"
+
+openhab_ip="${OPENHAB_IP:-192.168.11.10}"
+openhab_http_port="${OPENHAB_HTTP_PORT:-8080}"
+openhab_https_port="${OPENHAB_HTTPS_PORT:-8443}"
+
+oh_user_id="${OH_USER_ID:-9999}"
+oh_group_id="${OH_GROUP_ID:-999}"
+
+TZ="${TZ:-Europe/Berlin}"
+
+cd "$WORK_DIR"
 
 container_file="./active_container"
-backup_dir="../"
+backup_base="${WORK_DIR}/../backups"
 
-openhab_ip="192.168.11.10"
-openhab_http_port="8080"
-openhab_https_port="8443"
+# ── Pre-flight checks ──────────────────────────────────────────────────────────
+preflight_errors=()
 
-oh_user_id="9999"
-oh_group_id="999"
+for cmd in docker jq zip rsync curl; do
+    command -v "$cmd" &>/dev/null || preflight_errors+=("Required command not found: $cmd")
+done
 
+docker ps &>/dev/null || preflight_errors+=("Docker daemon is not reachable")
+
+[[ -f "$container_file" ]] || preflight_errors+=("State file not found: $container_file")
+
+if [[ ${#preflight_errors[@]} -gt 0 ]]; then
+    for err in "${preflight_errors[@]}"; do
+        echo "ERROR: $err" >&2
+    done
+    exit 1
+fi
 
 timestamp=$(date +%Y%m%d_%H%M%S)
 
@@ -60,7 +80,8 @@ fi
 
 echo "starting backup"
 docker stop --time 30 "$current_container"
-zip -r "../backups/openhab_${timestamp}_${current_god}.zip" "$backup_dir/$current_god" \
+mkdir -p "$backup_base"
+zip -r "${backup_base}/openhab_${timestamp}_${current_god}.zip" "${OH_DATA_ROOT}/${current_god}" \
   -x "*/userdata/cache/*" -x "*/userdata/tmp/*"
 
 
@@ -70,8 +91,13 @@ if [[ "$(printf '%s\n' "$current_version" "$target_version" | sort -V | tail -n1
 	logger -t openhab-updater "Update available: current=$current_version latest=$target_version"
 	send_telegram "Update available: current=$current_version latest=$target_version. Performing update."
 	echo "Syncing ../$current_god -> ../$dormant_god ..."
-	rsync -aHAX --delete --numeric-ids --info=stats2 \
-	"../${current_god}/" "../${dormant_god}/"
+	if ! rsync -aHAX --delete --numeric-ids --info=stats2 \
+	  "${OH_DATA_ROOT}/${current_god}/" "${OH_DATA_ROOT}/${dormant_god}/"; then
+	  logger -t openhab-updater "ERROR: rsync failed; aborting upgrade"
+	  send_telegram "rsync failed when preparing $dormant_god; aborting upgrade."
+	  docker start "$current_container" >/dev/null
+	  exit 1
+	fi
 
 	
 	if docker ps -a --format '{{.Names}}' | grep -q "^${dormant_name}$"; then
@@ -85,20 +111,26 @@ if [[ "$(printf '%s\n' "$current_version" "$target_version" | sort -V | tail -n1
 	  --restart=always \
 	  -e USER_ID="$oh_user_id"	  \
 	  -e GROUP_ID="$oh_group_id" \
-	  -e TZ=Europe/Berlin \
+	  -e TZ="$TZ" \
 	  -e OPENHAB_HTTP_PORT="$openhab_http_port" \
 	  -e OPENHAB_HTTPS_PORT="$openhab_https_port" \
-	  -v "/volume1/docker/openhab/$dormant_god/addons:/openhab/addons" \
-	  -v "/volume1/docker/openhab/$dormant_god/conf:/openhab/conf" \
-	  -v "/volume1/docker/openhab/$dormant_god/userdata:/openhab/userdata" \
+	  -v "${OH_DATA_ROOT}/$dormant_god/addons:/openhab/addons" \
+	  -v "${OH_DATA_ROOT}/$dormant_god/conf:/openhab/conf" \
+	  -v "${OH_DATA_ROOT}/$dormant_god/userdata:/openhab/userdata" \
 	  "openhab/openhab:$target_tag"
 	then
 	  logger -t openhab-updater "ERROR: docker run failed for $dormant_name"
 	  send_telegram "docker run failed for $dormant_name"
 	  # Rollback:
-	  docker container stop -t 60 "$dormant_name" 2>/dev/null || true
+	  if ! docker container stop -t 60 "$dormant_name" 2>/dev/null; then
+	    logger -t openhab-updater "WARNING: could not stop $dormant_name (may already be stopped)"
+	  fi
 	  sleep 90
-	  docker start "$current_container" || true
+	  if ! docker start "$current_container"; then
+	    logger -t openhab-updater "ERROR: Failed to restart $current_container during rollback"
+	    send_telegram "CRITICAL: Failed to restart $current_container during rollback!"
+	    exit 1
+	  fi
 	  sleep 300
 
 	  if docker ps --format '{{.Names}}' | grep -q "^${current_container}$"; then
@@ -124,7 +156,13 @@ if [[ "$(printf '%s\n' "$current_version" "$target_version" | sort -V | tail -n1
 	
 	sleep 300
 	if ./check_oh.sh "$openhab_ip" "$openhab_http_port"; then
-	  echo "$dormant_god" > "$container_file"
+	  # Atomic write: write to temp, verify, then rename
+	  if ! printf '%s\n' "$dormant_god" > "${container_file}.tmp"; then
+	    logger -t openhab-updater "ERROR: Failed to write state file"
+	    send_telegram "CRITICAL: Failed to write state file after upgrade!"
+	    exit 1
+	  fi
+	  mv "${container_file}.tmp" "$container_file"
 	  logger -t openhab-updater "Upgrade successful: active=$dormant_god (was $current_god)"
 	  send_telegram "Upgrade successful: now active=$dormant_god (was $current_god)"
 	else
