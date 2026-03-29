@@ -1,0 +1,5 @@
+# Environment / secrets – never commit these
+.env
+
+# State file written at runtime (machine-specific)
+active_container
