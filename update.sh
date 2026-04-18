@@ -46,6 +46,9 @@ else
 fi
 dormant_name="openhab-$dormant_god"
 
+if docker ps -a --format '{{.Names}}' | grep -q "^${dormant_name}$"; then
+    docker update --restart=no "$dormant_name" 2>/dev/null || true
+fi
 
 docker pull "openhab/openhab:$target_tag"
 
@@ -127,6 +130,7 @@ if [[ "$(printf '%s\n' "$current_version" "$target_version" | sort -V | tail -n1
 	  echo "$dormant_god" > "$container_file"
 	  logger -t openhab-updater "Upgrade successful: active=$dormant_god (was $current_god)"
 	  send_telegram "Upgrade successful: now active=$dormant_god (was $current_god)"
+	  docker update --restart=no "$current_container" 2>/dev/null || true
 	else
 		logger -t openhab-updater "Upgrade failed during health-check. Restarting $current_god with version $current_version."
 		send_telegram "Upgrade failed during health-check. Restarting $current_god with version $current_version."
@@ -137,6 +141,8 @@ if [[ "$(printf '%s\n' "$current_version" "$target_version" | sort -V | tail -n1
 					logger -t openhab-updater "Rollback successful: now active=$current_god"
 					send_telegram "Rollback successful: now active=$current_god"
 					echo "Verified: $current_god is running"
+					docker stop "$dormant_name" 2>/dev/null || true
+					docker update --restart=no "$dormant_name" 2>/dev/null || true
 				else
 					logger -t openhab-updater "Rollback failed: no OH running"
 					send_telegram "Rollback failed: no OH running"
